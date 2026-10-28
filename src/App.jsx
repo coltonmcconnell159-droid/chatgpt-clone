@@ -251,6 +251,8 @@ function updateAssistantMessage(setChats, chatId, content) {
 
 function App() {
   const fileInputRef = useRef(null);
+  const importInputRef = useRef(null);
+  const recognitionRef = useRef(null);
 
   const [config, setConfig] = useState(() =>
     safeJsonParse(localStorage.getItem(STORAGE_CONFIG_KEY), defaultConfig)
@@ -293,6 +295,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState('');
   const [attachedImage, setAttachedImage] = useState(null);
 
@@ -336,6 +339,36 @@ function App() {
     setError('');
   };
 
+  const handleRenameActiveChat = () => {
+    if (!activeChat) return;
+    const nextName = window.prompt('Rename chat', activeChat.title || 'New chat');
+    if (nextName === null) return;
+
+    const trimmed = nextName.trim();
+    if (!trimmed) return;
+
+    setChats((previous) =>
+      previous.map((chat) => (chat.id === activeChat.id ? { ...chat, title: trimmed } : chat))
+    );
+  };
+
+  const handleDeleteChat = (chatId) => {
+    setChats((previous) => {
+      const nextChats = previous.filter((chat) => chat.id !== chatId);
+      if (nextChats.length === 0) {
+        const fresh = createNewChat('New chat');
+        setActiveChatId(fresh.id);
+        return [fresh];
+      }
+
+      if (chatId === activeChatId && nextChats[0]) {
+        setActiveChatId(nextChats[0].id);
+      }
+
+      return nextChats;
+    });
+  };
+
   const handleImagePick = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -351,6 +384,85 @@ function App() {
     };
     reader.readAsDataURL(file);
     event.target.value = '';
+  };
+
+  const handleExportChats = () => {
+    const blob = new Blob([JSON.stringify(chats, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'chat-history.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportChats = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = safeJsonParse(String(reader.result), null);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+          throw new Error('Import file is not a valid chat history array.');
+        }
+
+        setChats(parsed);
+        setActiveChatId(parsed[0].id);
+        setError('');
+      } catch (uploadError) {
+        setError(uploadError.message || 'Could not import that chat history file.');
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
+  const handleVoiceToggle = () => {
+    const SpeechRecognition =
+      window.SpeechRecognition ||
+      window.webkitSpeechRecognition ||
+      window.mozSpeechRecognition ||
+      null;
+
+    if (!SpeechRecognition) {
+      setError('Voice input is not supported in this browser.');
+      return;
+    }
+
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.continuous = false;
+
+    recognition.onresult = (event) => {
+      const transcript = event.results?.[0]?.[0]?.transcript || '';
+      if (transcript) {
+        setDraft((previous) => (previous ? `${previous} ${transcript}` : transcript));
+      }
+    };
+
+    recognition.onerror = () => {
+      setError('Voice input encountered an error. Please try again.');
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      recognitionRef.current = null;
+      setIsListening(false);
+    };
+
+    recognitionRef.current = recognition;
+    setIsListening(true);
+    recognition.start();
   };
 
   const handleSendMessage = async () => {
@@ -432,11 +544,7 @@ function App() {
 
       updateAssistantMessage(setChats, activeChatId, streamingReply || 'The API responded without content.');
     } catch (requestError) {
-      updateAssistantMessage(
-        setChats,
-        activeChatId,
-        `Error: ${requestError.message}`
-      );
+      updateAssistantMessage(setChats, activeChatId, `Error: ${requestError.message}`);
       setError(requestError.message);
     } finally {
       setIsLoading(false);
@@ -465,13 +573,24 @@ function App() {
         <div className="sidebar-section">
           <div className="section-label">Recent</div>
           {chats.map((chat) => (
-            <button
-              key={chat.id}
-              className={`chat-row ${chat.id === activeChatId ? 'active' : ''}`}
-              onClick={() => handleSelectChat(chat.id)}
-            >
-              <span className="chat-row-title">{chat.title}</span>
-            </button>
+            <div key={chat.id} className={`chat-row-wrap ${chat.id === activeChatId ? 'active' : ''}`}>
+              <button
+                className="chat-row"
+                onClick={() => handleSelectChat(chat.id)}
+              >
+                <span className="chat-row-title">{chat.title}</span>
+              </button>
+              <button
+                className="chat-delete"
+                aria-label={`Delete ${chat.title}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleDeleteChat(chat.id);
+                }}
+              >
+                ×
+              </button>
+            </div>
           ))}
         </div>
       </aside>
@@ -486,9 +605,16 @@ function App() {
           </div>
 
           <div className="topbar-actions">
-            <button className="ghost-button" onClick={startNewChat}>
-              New chat
+            <button className="ghost-button" onClick={handleRenameActiveChat}>
+              Rename
             </button>
+            <button className="ghost-button" onClick={handleExportChats}>
+              Export
+            </button>
+            <button className="ghost-button" onClick={() => importInputRef.current?.click()}>
+              Import
+            </button>
+            <input ref={importInputRef} type="file" accept="application/json" hidden onChange={handleImportChats} />
             <button className="icon-button" onClick={() => setShowSettings(true)} aria-label="Open settings">
               ⚙️
             </button>
@@ -566,6 +692,13 @@ function App() {
               aria-label="Upload image"
             >
               📎
+            </button>
+            <button
+              className={`voice-button ${isListening ? 'active' : ''}`}
+              onClick={handleVoiceToggle}
+              aria-label="Voice input"
+            >
+              🎙️
             </button>
             <input
               ref={fileInputRef}

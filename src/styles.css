@@ -66,12 +66,14 @@ button {
 .ghost-button,
 .primary-button,
 .send-button,
+.voice-button,
 .icon-button,
 .chat-row,
 .attach-button,
 .remove-attachment,
 .feature-badge,
-.toggle-pill {
+.toggle-pill,
+.chat-delete {
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.02);
   color: #edf5ff;
@@ -83,7 +85,8 @@ button {
 .ghost-button,
 .primary-button,
 .send-button,
-.attach-button {
+.attach-button,
+.voice-button {
   padding: 10px 14px;
   font-weight: 600;
 }
@@ -103,8 +106,10 @@ button {
 .icon-button:hover,
 .chat-row:hover,
 .attach-button:hover,
+.voice-button:hover,
 .remove-attachment:hover,
-.toggle-pill:hover {
+.toggle-pill:hover,
+.chat-delete:hover {
   background: rgba(255, 255, 255, 0.07);
 }
 
@@ -120,11 +125,23 @@ button {
   margin: 8px 8px 12px;
 }
 
+.chat-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chat-row-wrap.active .chat-row {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(140, 165, 255, 0.4);
+}
+
 .chat-row {
+  flex: 1;
   width: 100%;
   text-align: left;
   padding: 12px 12px;
-  margin-bottom: 8px;
   background: transparent;
   color: #dfe9ff;
   display: block;
@@ -133,9 +150,14 @@ button {
   white-space: nowrap;
 }
 
-.chat-row.active {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(140, 165, 255, 0.4);
+.chat-delete {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: #ffd3d3;
 }
 
 .chat-panel {
@@ -160,6 +182,7 @@ button {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .brand-mark {
@@ -403,7 +426,8 @@ button {
   box-shadow: 0 0 0 1px rgba(126, 149, 204, 0.12);
 }
 
-.attach-button {
+.attach-button,
+.voice-button {
   width: 42px;
   height: 42px;
   display: inline-flex;
@@ -411,6 +435,11 @@ button {
   justify-content: center;
   padding: 0;
   font-size: 18px;
+}
+
+.voice-button.active {
+  background: rgba(255, 88, 88, 0.2);
+  border-color: rgba(255, 120, 120, 0.5);
 }
 
 .composer textarea {
