@@ -1,2 +1,4 @@
-# chatgpt-clone
-A ChatGPT-inspired local chat client with configurable OpenAI-compatible API integration.
+node_modules
+dist
+.vite
+.DS_Store
