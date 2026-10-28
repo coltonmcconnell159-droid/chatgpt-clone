@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const STORAGE_CONFIG_KEY = 'chatgpt-clone-config';
 const STORAGE_CHAT_KEY = 'chatgpt-clone-chats';
@@ -8,11 +8,16 @@ const defaultConfig = {
   baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-4o-mini',
   systemPrompt:
-    'You are a helpful, concise assistant. Be direct, professional, and clear.'
+    'You are a helpful, concise assistant. Be direct, professional, and clear. Use the complete conversation history when it helps answer the user faithfully.',
+  webSearchEnabled: false,
+  memoryMode: 'full-history'
 };
 
 const createNewChat = (title = 'New chat') => ({
-  id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `chat-${Date.now()}`,
+  id:
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `chat-${Date.now()}`,
   title,
   messages: []
 });
@@ -25,7 +30,119 @@ const safeJsonParse = (value, fallback) => {
   }
 };
 
+const summarizeTitle = (text) => {
+  const cleaned = (text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return 'New chat';
+  return cleaned.slice(0, 28) + (cleaned.length > 28 ? '…' : '');
+};
+
+const normalizeTextFromContent = (content) => {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && part.type === 'text' && part.text) return part.text;
+        if (part && part.type === 'image_url' && part.image_url?.url) return '[image]';
+        return '';
+      })
+      .join(' ')
+      .trim();
+  }
+  if (content && typeof content === 'object' && content.text) return content.text;
+  return '';
+};
+
+const normalizeMessageForApi = (message) => {
+  const baseContent = message?.content ?? '';
+
+  if (typeof baseContent === 'string') {
+    return { role: message.role, content: baseContent };
+  }
+
+  if (Array.isArray(baseContent)) {
+    return {
+      role: message.role,
+      content: baseContent.map((part) => {
+        if (part && part.type === 'text') {
+          return { type: 'text', text: part.text || '' };
+        }
+
+        if (part && part.type === 'image_url') {
+          return {
+            type: 'image_url',
+            image_url: { url: part.image_url?.url || '' }
+          };
+        }
+
+        return { type: 'text', text: '' };
+      })
+    };
+  }
+
+  return { role: message.role, content: String(baseContent || '') };
+};
+
+const buildUserMessagePayload = (text, attachedImage) => {
+  const content = [];
+  if (text && text.trim()) {
+    content.push({ type: 'text', text: text.trim() });
+  }
+
+  if (attachedImage?.dataUrl) {
+    content.push({
+      type: 'image_url',
+      image_url: { url: attachedImage.dataUrl }
+    });
+  }
+
+  return {
+    role: 'user',
+    content: content.length === 1 && content[0].type === 'text' ? content[0].text : content
+  };
+};
+
+const formatSearchResults = (data) => {
+  try {
+    const abstract = data?.AbstractText || '';
+    const topics = data?.RelatedTopics || [];
+    const results = data?.Results || [];
+
+    const selections = [];
+    if (abstract) selections.push(`Summary: ${abstract}`);
+
+    for (const topic of topics.slice(0, 4)) {
+      if (typeof topic === 'string') selections.push(topic);
+      else if (topic?.Text) selections.push(topic.Text);
+    }
+
+    for (const result of results.slice(0, 4)) {
+      if (result?.Text) selections.push(result.Text);
+    }
+
+    return selections.slice(0, 8).join('\n\n') || 'No web results found.';
+  } catch {
+    return 'No web results found.';
+  }
+};
+
+async function fetchWebContext(query) {
+  const endpoint = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+    query
+  )}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+
+  const response = await fetch(endpoint, { headers: { Accept: 'application/json' } });
+  if (!response.ok) {
+    throw new Error(`Web search failed (${response.status})`);
+  }
+
+  const data = await response.json();
+  return formatSearchResults(data);
+}
+
 function App() {
+  const fileInputRef = useRef(null);
+
   const [config, setConfig] = useState(() =>
     safeJsonParse(localStorage.getItem(STORAGE_CONFIG_KEY), defaultConfig)
   );
@@ -38,13 +155,16 @@ function App() {
 
     return [
       {
-        id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 'welcome-chat',
+        id:
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : 'welcome-chat',
         title: 'Welcome',
         messages: [
           {
             role: 'assistant',
             content:
-              'Welcome! Configure your OpenAI-compatible API in settings, then start chatting.'
+              'Welcome! Configure your OpenAI-compatible API in settings, then start chatting. Full-history memory and image + web-search tools are enabled in this build.'
           }
         ]
       }
@@ -63,7 +183,9 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState('');
+  const [attachedImage, setAttachedImage] = useState(null);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_CONFIG_KEY, JSON.stringify(config));
@@ -96,6 +218,7 @@ function App() {
     setChats((previous) => [nextChat, ...previous]);
     setActiveChatId(nextChat.id);
     setDraft('');
+    setAttachedImage(null);
     setError('');
   };
 
@@ -104,12 +227,41 @@ function App() {
     setError('');
   };
 
+  const handleImagePick = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setAttachedImage({
+        name: file.name,
+        size: file.size,
+        mime: file.type,
+        dataUrl: String(reader.result || '')
+      });
+    };
+    reader.readAsDataURL(file);
+    event.target.value = '';
+  };
+
+  const buildRequestMessages = (incomingUserMessage) => {
+    const systemMessages = config.systemPrompt.trim()
+      ? [{ role: 'system', content: config.systemPrompt.trim() }]
+      : [];
+
+    const previousMessages = (activeChat?.messages || []).map((message) =>
+      normalizeMessageForApi(message)
+    );
+
+    return [...systemMessages, ...previousMessages, incomingUserMessage];
+  };
+
   const handleSendMessage = async () => {
-    if (!draft.trim() || isLoading) {
+    if ((!draft.trim() && !attachedImage) || isLoading) {
       return;
     }
 
-    const userMessage = draft.trim();
+    const userText = draft.trim();
     if (!config.apiKey.trim()) {
       setError('Add an API key in settings before sending requests.');
       setShowSettings(true);
@@ -122,8 +274,28 @@ function App() {
       return;
     }
 
+    let webContext = '';
+    if (config.webSearchEnabled && userText) {
+      try {
+        setIsSearching(true);
+        webContext = await fetchWebContext(userText);
+      } catch (searchError) {
+        console.warn(searchError);
+        setError('Web search failed, but the chat request will still continue without browsing context.');
+      } finally {
+        setIsSearching(false);
+      }
+    }
+
+    const userContent = buildUserMessagePayload(
+      webContext
+        ? `${userText}\n\nWeb context:\n${webContext}`
+        : userText,
+      attachedImage
+    );
+
     const conversationBeforeSend = activeChat?.messages || [];
-    const userPayload = { role: 'user', content: userMessage };
+    const userPayload = { role: 'user', content: userContent.content };
     const assistantPlaceholder = { role: 'assistant', content: 'Thinking…' };
 
     setChats((previous) =>
@@ -133,25 +305,23 @@ function App() {
         }
 
         const nextTitle =
-          chat.title === 'New chat' ? userMessage.slice(0, 22) || 'New chat' : chat.title;
+          chat.title === 'New chat' ? summarizeTitle(userText || 'Image message') : chat.title;
 
         return {
           ...chat,
           title: nextTitle,
-          messages: [...chat.messages, userPayload, assistantPlaceholder]
+          messages: [...chat.messages, userContent, assistantPlaceholder]
         };
       })
     );
 
     setDraft('');
+    setAttachedImage(null);
     setIsLoading(true);
     setError('');
 
     try {
-      const systemMessages = config.systemPrompt.trim()
-        ? [{ role: 'system', content: config.systemPrompt.trim() }]
-        : [];
-
+      const requestMessages = buildRequestMessages(userPayload);
       const response = await fetch(
         `${config.baseUrl.trim().replace(/\/+$/, '')}/chat/completions`,
         {
@@ -162,7 +332,7 @@ function App() {
           },
           body: JSON.stringify({
             model: config.model,
-            messages: [...systemMessages, ...conversationBeforeSend, userPayload],
+            messages: requestMessages,
             temperature: 0.7
           })
         }
@@ -278,17 +448,31 @@ function App() {
         <div className="conversation-wrap">
           {activeChat?.messages.length ? (
             <div className="messages">
-              {activeChat.messages.map((message, index) => (
-                <div
-                  key={`${message.role}-${index}`}
-                  className={`message-row ${message.role === 'user' ? 'user' : 'assistant'}`}
-                >
-                  <div className="avatar">{message.role === 'user' ? 'U' : 'AI'}</div>
-                  <div className="message-bubble">
-                    {message.content}
+              {activeChat.messages.map((message, index) => {
+                const textContent = normalizeTextFromContent(message.content);
+                const imageAttachment = Array.isArray(message.content)
+                  ? message.content.find((part) => part?.type === 'image_url')
+                  : null;
+
+                return (
+                  <div
+                    key={`${message.role}-${index}`}
+                    className={`message-row ${message.role === 'user' ? 'user' : 'assistant'}`}
+                  >
+                    <div className="avatar">{message.role === 'user' ? 'U' : 'AI'}</div>
+                    <div className="message-bubble">
+                      {imageAttachment && (
+                        <img
+                          className="attached-preview"
+                          src={imageAttachment.image_url?.url}
+                          alt="Uploaded attachment"
+                        />
+                      )}
+                      {textContent && <div className="message-text">{textContent}</div>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div className="empty-state">
@@ -301,18 +485,64 @@ function App() {
         {error && <div className="error-banner">{error}</div>}
 
         <div className="composer-wrap">
+          <div className="composer-tools">
+            <label className="toggle-pill">
+              <input
+                type="checkbox"
+                checked={Boolean(config.webSearchEnabled)}
+                onChange={(event) =>
+                  setConfig((previous) => ({
+                    ...previous,
+                    webSearchEnabled: event.target.checked
+                  }))
+                }
+              />
+              Web browse
+            </label>
+            <span className="feature-badge">Full history memory</span>
+            {isSearching && <span className="feature-badge muted">Browsing…</span>}
+          </div>
+
           <div className="composer">
+            <button
+              className="attach-button"
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Upload image"
+            >
+              📎
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={handleImagePick}
+            />
+
             <textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={handleKeyDown}
               rows={1}
-              placeholder="Message the assistant…"
+              placeholder={
+                config.webSearchEnabled
+                  ? 'Ask a question or browse the web…'
+                  : 'Message the assistant…'
+              }
             />
-            <button className="send-button" onClick={handleSendMessage} disabled={isLoading || !draft.trim()}>
+            <button className="send-button" onClick={handleSendMessage} disabled={isLoading || (!draft.trim() && !attachedImage)}>
               {isLoading ? '...' : 'Send'}
             </button>
           </div>
+
+          {attachedImage && (
+            <div className="attachment-preview">
+              <span>{attachedImage.name}</span>
+              <button className="remove-attachment" onClick={() => setAttachedImage(null)}>
+                Remove
+              </button>
+            </div>
+          )}
         </div>
       </main>
 
@@ -354,6 +584,29 @@ function App() {
               />
             </label>
 
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={Boolean(config.webSearchEnabled)}
+                onChange={(event) =>
+                  setConfig((previous) => ({
+                    ...previous,
+                    webSearchEnabled: event.target.checked
+                  }))
+                }
+              />
+              Enable web browsing (DuckDuckGo results)
+            </label>
+
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked
+                readOnly
+              />
+              Full-history memory enabled
+            </label>
+
             <label>
               System prompt
               <textarea
@@ -381,3 +634,5 @@ function App() {
 }
 
 export default App;
+
+
