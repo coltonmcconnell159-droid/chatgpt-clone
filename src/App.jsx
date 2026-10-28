@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 const STORAGE_CONFIG_KEY = 'chatgpt-clone-config';
 const STORAGE_CHAT_KEY = 'chatgpt-clone-chats';
@@ -140,6 +142,113 @@ async function fetchWebContext(query) {
   return formatSearchResults(data);
 }
 
+async function streamChatCompletion({ baseUrl, apiKey, model, messages }) {
+  const response = await fetch(`${baseUrl.trim().replace(/\/+$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey.trim()}`
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.7,
+      stream: true
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`API request failed (${response.status}): ${text.slice(0, 220) || 'Unknown error'}`);
+  }
+
+  if (!response.body) {
+    throw new Error('Streaming is not supported by this endpoint.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split('\n\n');
+    buffer = chunks.pop() || '';
+
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n');
+      let payload = '';
+
+      for (const line of lines) {
+        if (line.startsWith('data:')) {
+          payload = line.slice(5).trim();
+        }
+      }
+
+      if (!payload || payload === '[DONE]') continue;
+
+      try {
+        const json = JSON.parse(payload);
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string') {
+          fullText += delta;
+        }
+      } catch {
+        // ignore malformed stream chunk
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    const lines = buffer.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        try {
+          const json = JSON.parse(payload);
+          const delta = json?.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string') {
+            fullText += delta;
+          }
+        } catch {
+          // ignore malformed stream chunk
+        }
+      }
+    }
+  }
+
+  return fullText;
+}
+
+function updateAssistantMessage(setChats, chatId, content) {
+  setChats((previous) =>
+    previous.map((chat) => {
+      if (chat.id !== chatId) return chat;
+
+      const nextMessages = [...chat.messages];
+      if (nextMessages.length === 0) {
+        nextMessages.push({ role: 'assistant', content });
+        return { ...chat, messages: nextMessages };
+      }
+
+      const lastIndex = nextMessages.length - 1;
+      if (nextMessages[lastIndex]?.role === 'assistant') {
+        nextMessages[lastIndex] = { ...nextMessages[lastIndex], content };
+      } else {
+        nextMessages.push({ role: 'assistant', content });
+      }
+
+      return { ...chat, messages: nextMessages };
+    })
+  );
+}
+
 function App() {
   const fileInputRef = useRef(null);
 
@@ -244,18 +353,6 @@ function App() {
     event.target.value = '';
   };
 
-  const buildRequestMessages = (incomingUserMessage) => {
-    const systemMessages = config.systemPrompt.trim()
-      ? [{ role: 'system', content: config.systemPrompt.trim() }]
-      : [];
-
-    const previousMessages = (activeChat?.messages || []).map((message) =>
-      normalizeMessageForApi(message)
-    );
-
-    return [...systemMessages, ...previousMessages, incomingUserMessage];
-  };
-
   const handleSendMessage = async () => {
     if ((!draft.trim() && !attachedImage) || isLoading) {
       return;
@@ -281,16 +378,14 @@ function App() {
         webContext = await fetchWebContext(userText);
       } catch (searchError) {
         console.warn(searchError);
-        setError('Web search failed, but the chat request will still continue without browsing context.');
+        setError('Web search failed, but the chat request will continue without browsing context.');
       } finally {
         setIsSearching(false);
       }
     }
 
     const userContent = buildUserMessagePayload(
-      webContext
-        ? `${userText}\n\nWeb context:\n${webContext}`
-        : userText,
+      webContext ? `${userText}\n\nWeb context:\n${webContext}` : userText,
       attachedImage
     );
 
@@ -321,71 +416,26 @@ function App() {
     setError('');
 
     try {
-      const requestMessages = buildRequestMessages(userPayload);
-      const response = await fetch(
-        `${config.baseUrl.trim().replace(/\/+$/, '')}/chat/completions`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${config.apiKey.trim()}`
-          },
-          body: JSON.stringify({
-            model: config.model,
-            messages: requestMessages,
-            temperature: 0.7
-          })
-        }
-      );
+      const systemMessages = config.systemPrompt.trim()
+        ? [{ role: 'system', content: config.systemPrompt.trim() }]
+        : [];
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `API request failed (${response.status}): ${errorText.slice(0, 220) || 'Unknown error'}`
-        );
-      }
+      const normalizedHistory = conversationBeforeSend.map((message) => normalizeMessageForApi(message));
+      const requestMessages = [...systemMessages, ...normalizedHistory, normalizeMessageForApi(userPayload)];
 
-      const data = await response.json();
-      const assistantReply =
-        data?.choices?.[0]?.message?.content ||
-        'The API responded without a usable message.';
+      const streamingReply = await streamChatCompletion({
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        model: config.model,
+        messages: requestMessages
+      });
 
-      setChats((previous) =>
-        previous.map((chat) => {
-          if (chat.id !== activeChatId) {
-            return chat;
-          }
-
-          const messages = [...chat.messages];
-          const lastIndex = messages.length - 1;
-          if (messages[lastIndex]?.role === 'assistant') {
-            messages[lastIndex] = { role: 'assistant', content: assistantReply };
-          } else {
-            messages.push({ role: 'assistant', content: assistantReply });
-          }
-
-          return { ...chat, messages };
-        })
-      );
+      updateAssistantMessage(setChats, activeChatId, streamingReply || 'The API responded without content.');
     } catch (requestError) {
-      setChats((previous) =>
-        previous.map((chat) => {
-          if (chat.id !== activeChatId) {
-            return chat;
-          }
-
-          const messages = [...chat.messages];
-          const lastIndex = messages.length - 1;
-          const errorContent = `Error: ${requestError.message}`;
-
-          if (messages[lastIndex]?.role === 'assistant') {
-            messages[lastIndex] = { role: 'assistant', content: errorContent };
-          } else {
-            messages.push({ role: 'assistant', content: errorContent });
-          }
-
-          return { ...chat, messages };
-        })
+      updateAssistantMessage(
+        setChats,
+        activeChatId,
+        `Error: ${requestError.message}`
       );
       setError(requestError.message);
     } finally {
@@ -468,7 +518,13 @@ function App() {
                           alt="Uploaded attachment"
                         />
                       )}
-                      {textContent && <div className="message-text">{textContent}</div>}
+                      {message.role === 'assistant' && textContent ? (
+                        <div className="markdown-body">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{textContent}</ReactMarkdown>
+                        </div>
+                      ) : textContent ? (
+                        <div className="message-text">{textContent}</div>
+                      ) : null}
                     </div>
                   </div>
                 );
@@ -599,11 +655,7 @@ function App() {
             </label>
 
             <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked
-                readOnly
-              />
+              <input type="checkbox" checked readOnly />
               Full-history memory enabled
             </label>
 
@@ -634,5 +686,3 @@ function App() {
 }
 
 export default App;
-
-
