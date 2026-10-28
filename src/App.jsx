@@ -5,14 +5,43 @@ import remarkGfm from 'remark-gfm';
 const STORAGE_CONFIG_KEY = 'chatgpt-clone-config';
 const STORAGE_CHAT_KEY = 'chatgpt-clone-chats';
 
+const providerPresets = {
+  'openai-compatible': {
+    label: 'OpenAI-compatible',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    apiKeyHint: 'sk-...'
+  },
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    apiKeyHint: 'sk-...'
+  },
+  ollama: {
+    label: 'Ollama',
+    baseUrl: 'http://localhost:11434/v1',
+    model: 'llama3.1',
+    apiKeyHint: 'optional'
+  },
+  'lm-studio': {
+    label: 'LM Studio',
+    baseUrl: 'http://localhost:1234/v1',
+    model: 'local-model',
+    apiKeyHint: 'optional'
+  }
+};
+
 const defaultConfig = {
+  provider: 'openai-compatible',
   apiKey: '',
-  baseUrl: 'https://api.openai.com/v1',
-  model: 'gpt-4o-mini',
+  baseUrl: providerPresets['openai-compatible'].baseUrl,
+  model: providerPresets['openai-compatible'].model,
   systemPrompt:
     'You are a helpful, concise assistant. Be direct, professional, and clear. Use the complete conversation history when it helps answer the user faithfully.',
   webSearchEnabled: false,
-  memoryMode: 'full-history'
+  memoryMode: 'full-history',
+  streamingEnabled: true
 };
 
 const createNewChat = (title = 'New chat') => ({
@@ -142,24 +171,29 @@ async function fetchWebContext(query) {
   return formatSearchResults(data);
 }
 
-async function streamChatCompletion({ baseUrl, apiKey, model, messages }) {
+async function fetchChatCompletion({ baseUrl, apiKey, model, messages, stream = false }) {
   const response = await fetch(`${baseUrl.trim().replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey.trim()}`
+      ...(apiKey ? { Authorization: `Bearer ${apiKey.trim()}` } : {})
     },
     body: JSON.stringify({
       model,
       messages,
       temperature: 0.7,
-      stream: true
+      stream
     })
   });
 
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`API request failed (${response.status}): ${text.slice(0, 220) || 'Unknown error'}`);
+  }
+
+  if (!stream) {
+    const data = await response.json();
+    return data?.choices?.[0]?.message?.content || 'The API responded without content.';
   }
 
   if (!response.body) {
@@ -223,7 +257,7 @@ async function streamChatCompletion({ baseUrl, apiKey, model, messages }) {
     }
   }
 
-  return fullText;
+  return fullText || 'The API responded without content.';
 }
 
 function updateAssistantMessage(setChats, chatId, content) {
@@ -324,6 +358,16 @@ function App() {
       setActiveChatId(chats[0].id);
     }
   }, [activeChat, chats]);
+
+  const applyProviderPreset = (provider) => {
+    const preset = providerPresets[provider] || providerPresets['openai-compatible'];
+    setConfig((previous) => ({
+      ...previous,
+      provider,
+      baseUrl: preset.baseUrl,
+      model: preset.model
+    }));
+  };
 
   const startNewChat = () => {
     const nextChat = createNewChat('New chat');
@@ -471,7 +515,7 @@ function App() {
     }
 
     const userText = draft.trim();
-    if (!config.apiKey.trim()) {
+    if (!config.apiKey.trim() && config.provider !== 'ollama' && config.provider !== 'lm-studio') {
       setError('Add an API key in settings before sending requests.');
       setShowSettings(true);
       return;
@@ -535,14 +579,37 @@ function App() {
       const normalizedHistory = conversationBeforeSend.map((message) => normalizeMessageForApi(message));
       const requestMessages = [...systemMessages, ...normalizedHistory, normalizeMessageForApi(userPayload)];
 
-      const streamingReply = await streamChatCompletion({
-        baseUrl: config.baseUrl,
-        apiKey: config.apiKey,
-        model: config.model,
-        messages: requestMessages
-      });
+      let reply = '';
+      if (config.streamingEnabled !== false) {
+        try {
+          reply = await fetchChatCompletion({
+            baseUrl: config.baseUrl,
+            apiKey: config.apiKey,
+            model: config.model,
+            messages: requestMessages,
+            stream: true
+          });
+        } catch (streamError) {
+          console.warn(streamError);
+          reply = await fetchChatCompletion({
+            baseUrl: config.baseUrl,
+            apiKey: config.apiKey,
+            model: config.model,
+            messages: requestMessages,
+            stream: false
+          });
+        }
+      } else {
+        reply = await fetchChatCompletion({
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
+          model: config.model,
+          messages: requestMessages,
+          stream: false
+        });
+      }
 
-      updateAssistantMessage(setChats, activeChatId, streamingReply || 'The API responded without content.');
+      updateAssistantMessage(setChats, activeChatId, reply || 'The API responded without content.');
     } catch (requestError) {
       updateAssistantMessage(setChats, activeChatId, `Error: ${requestError.message}`);
       setError(requestError.message);
@@ -574,10 +641,7 @@ function App() {
           <div className="section-label">Recent</div>
           {chats.map((chat) => (
             <div key={chat.id} className={`chat-row-wrap ${chat.id === activeChatId ? 'active' : ''}`}>
-              <button
-                className="chat-row"
-                onClick={() => handleSelectChat(chat.id)}
-              >
+              <button className="chat-row" onClick={() => handleSelectChat(chat.id)}>
                 <span className="chat-row-title">{chat.title}</span>
               </button>
               <button
@@ -746,6 +810,20 @@ function App() {
             </div>
 
             <label>
+              Provider
+              <select
+                value={config.provider || 'openai-compatible'}
+                onChange={(event) => applyProviderPreset(event.target.value)}
+              >
+                {Object.entries(providerPresets).map(([key, value]) => (
+                  <option key={key} value={key}>
+                    {value.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
               API base URL
               <input
                 value={config.baseUrl}
@@ -760,7 +838,7 @@ function App() {
                 type="password"
                 value={config.apiKey}
                 onChange={(event) => setConfig((previous) => ({ ...previous, apiKey: event.target.value }))}
-                placeholder="sk-..."
+                placeholder={providerPresets[config.provider]?.apiKeyHint || 'sk-...'}
               />
             </label>
 
@@ -769,8 +847,22 @@ function App() {
               <input
                 value={config.model}
                 onChange={(event) => setConfig((previous) => ({ ...previous, model: event.target.value }))}
-                placeholder="gpt-4o-mini"
+                placeholder={providerPresets[config.provider]?.model || 'gpt-4o-mini'}
               />
+            </label>
+
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={Boolean(config.streamingEnabled)}
+                onChange={(event) =>
+                  setConfig((previous) => ({
+                    ...previous,
+                    streamingEnabled: event.target.checked
+                  }))
+                }
+              />
+              Enable streaming responses
             </label>
 
             <label className="toggle-row">

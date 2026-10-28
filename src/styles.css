@@ -27,7 +27,7 @@ body {
   color: #ecf3ff;
 }
 
-button, input, textarea {
+button, input, textarea, select {
   font: inherit;
 }
 
@@ -442,6 +442,16 @@ button {
   border-color: rgba(255, 120, 120, 0.5);
 }
 
+.composer textarea,
+.settings-modal select,
+.settings-modal input,
+.settings-modal textarea {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  color: #edf4ff;
+}
+
 .composer textarea {
   flex: 1;
   border: none;
@@ -527,15 +537,12 @@ button {
   font-weight: 600;
 }
 
+.settings-modal select,
 .settings-modal input,
 .settings-modal textarea {
   display: block;
   width: 100%;
   margin-top: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.02);
-  color: #edf4ff;
   padding: 12px 14px;
   outline: none;
 }
